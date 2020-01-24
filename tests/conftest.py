@@ -1,4 +1,5 @@
 from asyncio import Event
+from collections import deque
 
 import aiohttp
 import msgpack
@@ -51,26 +52,21 @@ def arguments(http_port, proxy_secret, jaeger_route):
 
 
 @pytest.fixture
-def services(api_service, sender_service):
-    return [api_service, sender_service]
-
-
-@pytest.fixture
-def api_service(arguments):
-    return API(
+def services(arguments):
+    queue = deque()
+    api = API(
         address=arguments.http_address,
         port=arguments.http_port,
         password=arguments.http_password,
         login=arguments.http_login,
+        queue=queue
     )
-
-
-@pytest.fixture
-def sender_service(arguments):
-    return Sender(
+    sender = Sender(
         jaeger_route=arguments.jaeger_route,
         interval=arguments.sender_interval,
+        queue=queue
     )
+    return [api, sender]
 
 
 @pytest.fixture

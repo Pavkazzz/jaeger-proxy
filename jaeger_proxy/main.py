@@ -1,30 +1,19 @@
-import asyncio
 import logging
 import os
 import pwd
 import sys
-from asyncio import gather
 from collections import deque
-from http import HTTPStatus
-from typing import NamedTuple
 
 import forklib
-from aiohttp import BasicAuth, ClientSession, hdrs
-from aiohttp.web import (
-    Application,
-    HTTPForbidden,
-    HTTPUnauthorized,
-    Request,
-    Response,
-)
 from aiomisc.entrypoint import entrypoint
 from aiomisc.log import LogFormat, basic_config
-from aiomisc.service.aiohttp import AIOHTTPService
-from aiomisc.service.periodic import PeriodicService
 from aiomisc.utils import bind_socket
 from configargparse import ArgumentParser
 from setproctitle import setproctitle
 from yarl import URL
+
+from jaeger_proxy.rest import API
+from jaeger_proxy.sender import Sender
 
 log = logging.getLogger()
 
@@ -52,129 +41,14 @@ group = parser.add_argument_group("HTTP settings")
 group.add_argument("--http-address", type=str, default="0.0.0.0")
 group.add_argument("--http-port", type=int, default=8080)
 group.add_argument("--http-password", type=str, required=True)
-group.add_argument("--http-login", type=str, default="edadeal")
+group.add_argument("--http-login", type=str, default="admin")
 
 group = parser.add_argument_group("Jaeger settings")
 group.add_argument("--jaeger-route", type=URL, required=True)
 
 group = parser.add_argument_group("Sender settings")
-parser.add_argument("--sender-interval", default=1, type=float)
-
-
-async def ping(*_):
-    return Response(content_type="text/plain", status=HTTPStatus.OK)
-
-
-BYPASS_HEADERS = [
-    hdrs.ACCEPT_ENCODING,
-    hdrs.CONTENT_LENGTH,
-    hdrs.CONTENT_TYPE,
-    hdrs.USER_AGENT,
-]
-
-
-async def statistic_receiver(request: Request):
-    auth = request.headers.get("Authorization")
-
-    if not auth:
-        raise HTTPUnauthorized
-    try:
-        basic = BasicAuth.decode(auth)
-    except ValueError:
-        log.exception("Failed to parse basic auth")
-        raise HTTPForbidden
-
-    if request.app["password"] != basic.password:
-        raise HTTPForbidden
-
-    if request.app["login"] != basic.login:
-        raise HTTPForbidden
-
-    data = await request.read()
-
-    bypass_headers = {
-        header: request.headers.get(header)
-        for header in BYPASS_HEADERS
-        if header
-    }
-    Sender.QUEUE.append((data, bypass_headers))
-
-    return Response(content_type="text/plain", status=HTTPStatus.ACCEPTED)
-
-
-class API(AIOHTTPService):
-    __required__ = "password", "login"
-
-    password: str
-    login: str
-
-    @staticmethod
-    async def setup_routes(app: Application):
-        router = app.router  # type: UrlDispatcher
-        router.add_get("/ping", ping)
-        router.add_post("/api/traces", statistic_receiver)
-
-    async def create_application(self) -> Application:
-        app = Application()
-        app.on_startup.append(self.setup_routes)
-        app["password"] = self.password
-        app["login"] = self.login
-        return app
-
-
-class Connection(NamedTuple):
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-
-    def write(self, data):
-        return self.writer.write(data)
-
-
-class Sender(PeriodicService):
-    __required__ = (
-        "jaeger_route",
-        "interval",
-    )
-
-    jaeger_route: URL
-    interval: float
-
-    bulk_size: int = 10000
-    QUEUE: deque = deque()
-    session: ClientSession = None
-
-    async def callback(self):
-        if not self.QUEUE:
-            return
-
-        metrics = []
-
-        while self.QUEUE or len(metrics) < self.bulk_size:
-            try:
-                metrics.append(self.QUEUE.popleft())
-            except IndexError:
-                break
-
-        await self.send(metrics)
-
-    async def stop(self, *args, **kwargs):
-        await super().stop(*args, **kwargs)
-
-        metrics = list(self.QUEUE)
-        self.QUEUE.clear()
-        await self.send(metrics)
-
-    async def send(self, metrics):
-        if not metrics:
-            return
-        async with ClientSession() as conn:
-            print(self.jaeger_route, "metrics", metrics)
-            await gather(
-                *[
-                    conn.post(self.jaeger_route, data=data, headers=headers)
-                    for data, headers in metrics
-                ]
-            )
+parser.add_argument("--sender-interval", default=1, type=float,
+                    help="interval to send in seconds")
 
 
 def main():
@@ -192,16 +66,18 @@ def main():
     sock = bind_socket(
         address=arguments.http_address, port=arguments.http_port
     )
-
+    queue = deque()
     services = [
         API(
             sock=sock,
             password=arguments.http_password,
             login=arguments.http_login,
+            queue=queue,
         ),
         Sender(
             jaeger_route=arguments.jaeger_route,
             interval=arguments.sender_interval,
+            queue=queue,
         ),
     ]
 
